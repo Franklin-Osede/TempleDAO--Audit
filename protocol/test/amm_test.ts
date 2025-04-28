@@ -1,5 +1,6 @@
 import { ethers } from "hardhat";
 import { expect } from "chai";
+import { Suite } from 'mocha';
 
 import {
   FakeERC20,
@@ -24,11 +25,14 @@ import { BigNumber, Signer } from "ethers";
 import { toAtto, shouldThrow, blockTimestamp, fromAtto } from "./helpers";
 import { zeroAddress } from "ethereumjs-util";
 
-const fmtPricePair = (pair: [BigNumber, BigNumber, number?]): [number, number] => {
+// Add type definition for price pair
+type PricePair = [BigNumber, BigNumber, number?];
+
+const fmtPricePair = (pair: PricePair): [number, number] => {
   return [fromAtto(pair[0]), fromAtto(pair[1])]
 }
 
-describe("AMM", async () => {
+describe("AMM", function(this: Suite) {
     let templeToken: TempleERC20Token;
     let fraxToken: FakeERC20;
     let feiToken: FakeERC20;
@@ -42,9 +46,9 @@ describe("AMM", async () => {
     let uniswapRouter: UniswapV2Router02NoEth;
     let uniswapPair: UniswapV2Pair;
 
-    const expiryDate = (): number =>  Math.floor(Date.now() / 1000) + 9000;
+    const expiryDate = (): number => Math.floor(Date.now() / 1000) + 9000;
    
-    beforeEach(async () => {
+    beforeEach(async function() {
       [owner, alan, ben] = await ethers.getSigners();
 
       templeToken = await new TempleERC20Token__factory(owner).deploy();
@@ -190,6 +194,36 @@ describe("AMM", async () => {
         const beforeTS = await blockTimestamp() - 1
         const EXPIRED_ERROR = /TempleStableAMMRouter: EXPIRED/
         await shouldThrow(templeRouter.swapExactTempleForStable(toAtto(1000), 1, fraxToken.address, await alan.getAddress(), beforeTS), EXPIRED_ERROR);
+    })
+
+    it("Vulnerability: Sells below IV should revert after TEMPLE is burned if defendStable has insufficient balance", async function() {
+      await templeToken.transfer(await alan.getAddress(), toAtto(900000));
+      
+      const [ivFrax, ivTemple] = await treasuryIV.intrinsicValueRatio();
+      
+      await templeRouter.setDefendStable(fraxToken.address);
+      
+      const routerBalance = await fraxToken.balanceOf(templeRouter.address);
+      if (routerBalance.gt(0)) {
+        await templeRouter.withdraw(fraxToken.address, await owner.getAddress(), routerBalance);
+      }
+      
+      await templeToken.connect(alan).approve(templeRouter.address, toAtto(900000));
+      
+      const initialTempleBalance = await templeToken.balanceOf(await alan.getAddress());
+      
+      try {
+        await templeRouter.connect(alan).swapExactTempleForStable(
+          toAtto(900000), 1, fraxToken.address, await alan.getAddress(), expiryDate()
+        );
+        expect(false).to.be.true;
+      } catch (error: any) {
+        expect(error.message).to.include("transfer amount exceeds balance");
+        
+        const finalTempleBalance = await templeToken.balanceOf(await alan.getAddress());
+        expect(finalTempleBalance).to.be.lt(initialTempleBalance);
+        expect(initialTempleBalance.sub(finalTempleBalance)).to.equal(toAtto(900000));
+      }
     })
    })
 
