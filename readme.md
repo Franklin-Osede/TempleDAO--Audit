@@ -1,135 +1,125 @@
-# Temple Monorepo
+### TempleDAO Protocol Security Review
 
-## Getting Started
-### Requirements
-* node 
-* yarn
-* Docker
+Voluntary Security Research & Methodologies for TempleDAO
 
-This repository uses `.nvmrc` to dictate the version of node required to compile and run the project. This will allow you to use `nvm` followed by either `nvm use` or `nvm install` to automatically set the right version of node in that terminal session.
+### About the TempleDAO Protocol
 
-If developing on Windows, some scripts are currently written in bash so WSL is recommended to run those. For most developments tasks you'll likely only need to run the steps in Protocol local deployment and Dapp.
+TempleDAO is a decentralized finance platform focused on token staking, liquidity provision, and yield optimization across multiple blockchains. Core functionalities include:
 
-### Quick Start 
+Staking: Users stake $TEMPLE tokens in vaults to earn protocol fees.
 
-**This script is still experimental so your mileage may vary**
+Liquidity Provision: Supply assets to TempleDAO pools to facilitate swaps and earn rewards.
 
-At the root of the project, running `yarn run:stack` will attempt to:  
-* compile the contracts
-* run a local hardhat node 
-* deploy the contracts to said node
-* copy deployed contract addresses to dapps config file
-* copy hardhat factories into the dapp 
-* run the dapp in dev mode
+Yield Strategies: Automated farming strategies that aggregate yields from underlying protocols.
 
-The script groups the child processes so issuing a single `SIGINT` (ctrl+c) should stop all the processes. 
+Governance: On-chain voting and treasury management mechanisms.
 
-Requirements:  
-* bash
-* rsync
-* sed
-* grep
+Visit the official site: templedao.link
 
-### Contracts (/Protocol)
-#### Local Deployment
-The protocol app uses hardhat for development. The following steps will compile the contracts and deploy to a local hardhat node
+### Repository Overview
 
-```
-# Enter the correct dir
-cd apps/protocol
+This repository hosts scripts, configuration files, and documentation detailing the security research approach applied to the TempleDAO smart contracts. The focus is on proactively exploring attack vectors without asserting current vulnerabilities.
 
-# Compile the contracts
-yarn compile
+Research Scope & Objectives
 
-# In one terminal window, run a local-node
-yarn local-node
+The voluntary review aims to:
 
-# In another window, run the deploy script
-yarn local-deploy
-```
+Map contract workflows: staking flows, reward distribution, and strategy execution.
 
-The protocol test suite can be run without deploying to a local-node by running
+Probe for reentrancy, unauthorized access, and race conditions.
 
-```
-# Run tests, no deployment necessary
-yarn test
-```
+Validate yield strategy logic under extreme market scenarios.
 
-#### Rinkeby Deployment
-```
-export RINKEBY_ADDRESS_PRIVATE_KEY=...  # export from metamask
-export RINKEBY_RPC_URL=... 		# grab RPC url from metamask or create a relayer on alchemy
+### Contracts under review:
 
-yarn hardhat:testnet run scripts/deploys/rinkeby/{your-script-name}
-```
+StakingVault.sol
 
-Once successfully deployed on testnet, verify contract source on etherscan. If you use the `deployAndMine` helper when creating your
-script, it will spit out the relevant command. It will look something like this
+LiquidityPool.sol
 
-```
-yarn hardhat verify --network rinkeby 0x359655dcB8A32479680Af81Eb38eA3Bb2B42Af54 
-```
+StrategyManager.sol
 
-It's fine to have multiple versions of a contract on rinkeby, so it's okay to run before your PR is merged (and re-run if there are any
-comments on the PR on how to best setup the deploy scripts).
+Governance.sol
 
-You can also run and test locally by replacing `yarn hardhat:testnet` with `yarn hardhat:local` in the protocol directory. You'll probably have to run some of the previous deploys
-in order to setup the right local state
+Treasury.sol
 
-### Dapp
-The Dapp uses [Vite](https://vitejs.dev/) but we've created some convenience methods on top. In order to properly communicate with the contracts deployed on the local node we need to update your `.env.local` file. Make a copy of the `env.local.example` and rename it to `.env.local`. Once the steps in Protocol Local Deployment have been completed, the deploy job output all the deployed contract addresses deployed to your local network in the correct Vite env var format. Copy these values and paste them into your `.env.local` file. 
+Techniques & Tools Used
 
-```
-# Enter the correct dir
-cd apps/dapp
+A hybrid methodology combining automated and manual testing:
 
-# Run the dapp in dev mode
-yarn dev
+### Static Analysis
 
-# Alternatively, you can compile the dapp and run in 'production' mode locally
-yarn build
+Slither: Solidity bug detection and code quality checks.
 
-yarn serve
-```
+Mythril: Symbolic analysis for common exploit patterns.
 
-## Vercel
+Securify & SmartCheck: Cross-verification of static findings.
 
-The integration with Vercel has changed. Because this is a monorepo, we have one parent folder with multiple subfolders as the apps that need to be deployed. Further complicating matters is that some apps that use typescript need to reference the parent folder since the tsconfig files source the parent one. To address this and other issues, this is how the vercel integration is setup:
+Dynamic & Fuzz Testing
 
-  - We are no longer integrating with Github through Vercel. If you open a project in Vercel, it should say "Connect Github".. implying it's NOT connected. This is what we want.
-  
-  **We do NOT want Vercel to automatically build/deploy through their integration. We are doing this now through GitHub Actions!**  
+Echidna: Property-based fuzzing for invariants like staking balances.
 
-  - For each mono repo application that needs to be deployed, there is one corresponding Vercel Project.
+Manticore: Symbolic execution to traverse complex staking and withdrawal logic.
 
-  - Each Vercel project *must* specify a Root Directory in settings that points to the monorepo folder. For ex, for the DApp, the Root Directory value is `apps/dapp`
+Foundry (forge): Custom solidity tests for edge-case scenarios.
 
-  - we deploy to Vercel using the Vercel CLI, through GitHub actions
+### Formal Verification
 
-  Deploying through GitHub Actions gives us the power to control what deploys when, based on branch/pr, make it easy to generate prod, staging and per PR urls (for ex, each PR can get a deployment like `https://pr-{number}.stage.templedao.link`)
+Certora Prover: Formal proofs for critical invariants (e.g., reward calculations).
 
+Manual Review & Penetration Techniques
 
-  ### How To Add New Project
+Code walkthroughs targeting unchecked math, oracle dependencies, and upgradeability.
 
-  Note, as a pre-requisite, it's assumed the following secrets exist in the github repo: `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `GITHUB_TOKEN`
+Transaction simulation via Hardhat to inspect revert reasons and event flows.
 
-  1. Create a new Vercel project. Sadly, Vercel is very pushy and wants to you to link the project to a github repo, which we don't want to do, so we have to go through these weird steps. 
-  
-  2. On your machine, make sure you have vercel cli installed, you're logged in with cli, and have enough permissions in Vercel account.
+Scripting with Brownie/Web3.py for multi-user and time-manipulation tests.
 
-  3. run just `vercel`. This should start the project creation wizard. Accept most of the defaults. Set scope to temple. Set project name.
+### Setup & Usage
 
-  4. Cancel when it starts deploying.
+# Clone repository
+git clone https://github.com/Franklin-Osede/TempleDAO--Audit.git
+cd TempleDAO--Audit
 
-  5. Go to Dashboard > project > settings > general and note the Project ID
+# Install dependencies
+npm install --save-dev slither-analyzer mythx-cli securify smartcheck
+npm install --save-dev echidna-core manticore forge
+npm install --save-dev solhint prettier prettier-plugin-solidity
 
-  6. Go to Github > TempleDAO/temple > settings > secrets, and add a new repository secret. Name: `[NAME]_PROJECT_ID` Value: projectid
+# Run Slither
+npx slither contracts/
 
-  7. Setup a GitHub action to deploy. Go into the .github/workflows folde. Copy an existing workflow, and edit the `vercel-project-id` entry to use the new GitHub secret env name you created (`[NAME]_PROJECT_ID`)
+# Echidna fuzz tests
+echidna-test contracts/ --config echidna-config.yaml
 
-  8. Tweak the workflow as needed; what branch/pr triggers, what aliases/urls to use, etc... 
+# Manticore analysis
+tm-manticore --output-dir reports/manticore contracts/StrategyManager.sol
 
+Documentation of Attempts
 
-  ## Contributing
+All tool executions and manual tests are logged under /research-logs, capturing:
 
-  We welcome all contributors to this project - please see the [contribution guide](https://github.com/TempleDAO/temple/blob/main/CONTRIBUTING.md) for more information on how to get involved and what to expect.
+Tool name & version
+
+Config parameters
+
+Timestamp
+
+Key observations (warnings, exceptions, anomalies)
+
+Current Status
+
+No vulnerabilities have been detected so far. Research is ongoing, and all new tests will be recorded in /research-logs.
+
+Collaboration
+
+Fellow researchers are encouraged to:
+
+Fork this repo and implement new test scripts or configurations.
+
+Open issues to suggest additional attack vectors or scenarios.
+
+Submit pull requests with improved tooling or sample exploit demonstrations.
+
+Disclaimer
+
+This review is a voluntary effort and not an official audit. Use these methodologies responsibly.
